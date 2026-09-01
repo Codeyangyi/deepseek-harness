@@ -29,6 +29,11 @@ import type { SnapshotStore } from '../contract/store.ts'
 import { createSnapshotStore } from '../contract/store.ts'
 import type { SessionFace } from '../contract/session.ts'
 import type { AgentContext, ISessions } from '../contract/sessions.ts'
+// Per-account session scoping (Plan A login gate): read the logged-in userId so
+// new sessions are namespaced and the sidebar only shows the current account's
+// sessions. Guarded — returns undefined when not authenticated, so the
+// single-user behavior and every existing test are unchanged.
+import { getCurrentUserId, isOwnedBy, sessionOwnerPrefix } from '../auth-context'
 import { createScope, scopeOf as scopeTagOf } from '../agents/scope.ts'
 import type { ConversationRuntime } from './conversation-assembler.ts'
 import { SessionManager } from './manager.ts'
@@ -191,6 +196,16 @@ function increasedForkTitle(title: string): string {
     return `${fullWidth[1]}（${BigInt(fullWidth[2]) + 1n}）`
   }
   return `${title} (1)`
+}
+
+/**
+ * Collision-resistant id fragment for namespaced (per-account) sessions. Uses
+ * the platform CSPRNG when available, with a fallback for non-browser contexts.
+ */
+function newSessionUuid(): string {
+  const c = globalThis.crypto
+  if (c !== undefined && typeof c.randomUUID === 'function') return c.randomUUID()
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 
 interface ScopeRecord {
@@ -483,8 +498,14 @@ export class SessionRuntime implements ISessions {
    * @throws {SessionCreateError} with the requested id.
    */
   async create(opts: { workspaceId?: WorkspaceId; cwd?: string; sessionId?: SessionId } = {}): Promise<SessionId> {
-    const result = await this.manager.create(opts)
-    if (!result.ok) throw new SessionCreateError(result.error, opts.sessionId)
+    // Namespace new sessions under the logged-in account so the sidebar and
+    // persistence stay per-user. No-op when unauthenticated.
+    const userId = getCurrentUserId()
+    const createOpts = userId === undefined || opts.sessionId !== undefined
+      ? opts
+      : { ...opts, sessionId: `${sessionOwnerPrefix(userId)}${newSessionUuid()}` as SessionId }
+    const result = await this.manager.create(createOpts)
+    if (!result.ok) throw new SessionCreateError(result.error, createOpts.sessionId)
     this.projectList()
     return result.value.sessionId
   }
@@ -661,9 +682,14 @@ export class SessionRuntime implements ISessions {
     const {
       items, current, phase, subagentsByParent, jobsBySession, currentAddress,
     } = this.manager.getListSnapshot()
+    // Per-account isolation: when authenticated, only surface this account's
+    // sessions (ids are namespaced with the userId prefix on create).
+    const userId = getCurrentUserId()
+    const ownerPrefix = userId === undefined ? undefined : sessionOwnerPrefix(userId)
     const ids: SessionId[] = []
     const byId: Record<SessionId, SessionSummary> = {}
     for (const entry of items) {
+      if (ownerPrefix !== undefined && !isOwnedBy(entry.sessionId, userId as string)) continue
       ids.push(entry.sessionId)
       byId[entry.sessionId] = {
         id: entry.sessionId,
@@ -715,21 +741,24 @@ export class SessionRuntime implements ISessions {
       }
     }
     const persisted = this.selection.getSnapshot().sessionId
+    // A persisted selection that was filtered out (belongs to another account)
+    // must not surface as current.
+    const effectiveCurrent = current !== undefined && byId[current] === undefined ? undefined : current
     // No current (cleared, or masked gap) wipes the persisted cell — a reload
     // stays on empty; the in-memory selection still resurfaces a masked id.
-    if (current === undefined) {
+    if (effectiveCurrent === undefined) {
       if (persisted !== undefined) this.selection.set({})
-    } else if (byId[current] !== undefined
-      && (persisted !== current
+    } else if (byId[effectiveCurrent] !== undefined
+      && (persisted !== effectiveCurrent
         || this.selection.getSnapshot().subagentAddress?.childSessionId !== currentAddress?.childSessionId
         || this.selection.getSnapshot().subagentAddress?.parentSessionId !== currentAddress?.parentSessionId
         || this.selection.getSnapshot().subagentAddress?.mode !== currentAddress?.mode)) {
       this.selection.set({
-        sessionId: current,
+        sessionId: effectiveCurrent,
         ...(currentAddress === undefined ? {} : { subagentAddress: currentAddress }),
       })
     }
-    this.list.set({ ids, byId, current, phase, subagentsByParent, jobsBySession, currentAddress })
+    this.list.set({ ids, byId, current: effectiveCurrent, phase, subagentsByParent, jobsBySession, currentAddress })
     this.pruneScopes()
   }
 

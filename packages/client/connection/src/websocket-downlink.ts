@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import WebSocket, { WebSocketServer } from 'ws'
+import { getRequestUserResolver, runWithActiveUser } from '@deepseek-ai/dsh-home-paths'
 import type {
   ApiProxy, HostFrame, MuxFrame, RpcRequest, ServerRequest,
 } from '@deepseek-ai/dsh-host-apiproxy/api'
@@ -62,10 +63,16 @@ export class WebSocketDownlinks {
    * @param head - Bytes already read after the upgrade headers.
    */
   handleMux(req: IncomingMessage, socket: Duplex, head: Buffer): void {
-    this.upgrade(req, socket, head, signal => this.api.events.mux({
-      rpcId: RpcId(randomUUID()),
-      payload: {},
-    }, signal))
+    this.upgrade(req, socket, head, signal => {
+      // Stream-scoped isolation: resolve the caller from the upgrade request
+      // and open the stream inside runWithActiveUser so the mux baseline and
+      // every subsequent push are filtered to that user's sessions.
+      const userId = getRequestUserResolver()?.(req)
+      return runWithActiveUser(userId, () => this.api.events.mux({
+        rpcId: RpcId(randomUUID()),
+        payload: {},
+      }, signal))
+    })
   }
 
   /**
@@ -75,10 +82,13 @@ export class WebSocketDownlinks {
    * @param head - Bytes already read after the upgrade headers.
    */
   handleHost(req: IncomingMessage, socket: Duplex, head: Buffer): void {
-    this.upgrade(req, socket, head, signal => this.api.events.host({
-      rpcId: RpcId(randomUUID()),
-      payload: {},
-    }, signal))
+    this.upgrade(req, socket, head, signal => {
+      const userId = getRequestUserResolver()?.(req)
+      return runWithActiveUser(userId, () => this.api.events.host({
+        rpcId: RpcId(randomUUID()),
+        payload: {},
+      }, signal))
+    })
   }
 
   /**

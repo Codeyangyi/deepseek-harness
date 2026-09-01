@@ -77,6 +77,10 @@
     # below without a restart, and is what the web Models page writes.
     - id: settings
       name: '@deepseek-ai/dsh-settings-file'
+      config:
+        # Plan A isolation: each authenticated account's settings live under
+        # `~/.dsh/users/<id>/settings.yaml` instead of the shared document.
+        userScope: true
 
     # Credential sources: inherited environment over the managed
     # `$DSH_HOME/.credentials.yaml`, with project and user `.env` fallbacks.
@@ -84,6 +88,10 @@
     # managed document, which is never materialized into the process environment.
     - id: credentials
       name: '@deepseek-ai/dsh-credentials-local'
+      config:
+        # Plan A isolation: each authenticated account's credentials live under
+        # `~/.dsh/users/<id>/.credentials.yaml` instead of the shared document.
+        userScope: true
 
     # The pi-ai multi-provider twin, mounted dormant: zero routes (and no extra
     # models in the picker) until a `llm-pi-ai:` settings section supplies provider
@@ -99,6 +107,9 @@
       name: '@deepseek-ai/dsh-session-persistence-jsonl'
       config:
         root: !!js dshHomePath('sessions')
+        # Plan A isolation: each authenticated account's conversations live under
+        # `~/.dsh/users/<id>/sessions` instead of the shared `sessions` root.
+        userScope: true
 
     # Durable image bytes live outside the append-only session log. Messages
     # keep content-addressed references that this shared backend resolves for

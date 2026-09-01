@@ -7,7 +7,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { HostDescription, IApiClient } from './api.ts'
 import { ConnectionController, type ConnectionConfig, type ConnectionSinks, type ConnectionState } from './connection.ts'
 import { FixtureApiClient } from './fixture.ts'
-import { WebApiClient } from './web-api-client.ts'
+import { WebApiClient, setAuthTokenProvider } from './web-api-client.ts'
 import { createWebConnectionRpc } from './rpc.ts'
 import { isLoopbackHostname } from '../loopback-hostname.ts'
 import type { ClientConnectionRpc } from '../rpc.ts'
@@ -35,6 +35,7 @@ export {
   AbstractApiClient,
   transportError,
 } from './api.ts'
+export { setAuthTokenProvider }
 
 // Connection loop types are public through ConnectionHandle.start; the
 // controller remains package-internal.
@@ -82,6 +83,23 @@ export interface ConnectionHandle {
  * @param ctx - client cordis context.
  */
 export function apply(ctx: Context): void {
+  // Authenticated web deployments: feed the stored account token to the API
+  // carrier so every HTTP RPC and WebSocket stream carries the caller's
+  // identity (apps/web/src/auth.ts persists it under `dsh.auth`). The
+  // provider re-reads localStorage per request, so logout/account switch is
+  // picked up live; deployments without the login gate stay anonymous and
+  // the server's unauthenticated path is unchanged.
+  setAuthTokenProvider(() => {
+    if (typeof localStorage === 'undefined') return undefined
+    try {
+      const raw = localStorage.getItem('dsh.auth')
+      if (raw === null) return undefined
+      const parsed = JSON.parse(raw) as { token?: unknown }
+      return typeof parsed.token === 'string' ? parsed.token : undefined
+    } catch {
+      return undefined
+    }
+  })
   const pageLocation = typeof location === 'undefined' ? undefined : location
   const fixture = pageLocation !== undefined && new URLSearchParams(pageLocation.search).has('fixture')
   const fixtureClient = fixture ? new FixtureApiClient() : undefined

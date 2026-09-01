@@ -13,6 +13,12 @@
 
 # ── surface-specific values the base deliberately omits ─────────────────────
 
+# Plan A per-user isolation: the auth plugin resolves the active user for every
+# RPC and scopes sessions/credentials/settings under users/<id>/.
+- insert:
+    - id: dsh-auth
+      name: '@deepseek-ai/dsh-auth'
+
 - id: system-prompt
   config:
     persona: >-

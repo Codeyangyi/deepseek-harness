@@ -8,6 +8,7 @@ import { toFetchHandler } from '@deepseek-ai/dsh-host-apiproxy'
 import { API_PATH, HOST_EVENTS_PATH, MUX_EVENTS_PATH } from './api-path.ts'
 import { bridge, DEFAULT_MAX_REQUEST_BODY_BYTES } from './http-bridge.ts'
 import { assertTrustedAuthority, isTrustedApiRequest } from './api-request-trust.ts'
+import { getRequestUserResolver } from '@deepseek-ai/dsh-home-paths'
 import { HostConnectionService } from './rpc-host.ts'
 import { rejectWebSocketUpgrade, WebSocketDownlinks } from './websocket-downlink.ts'
 
@@ -182,6 +183,12 @@ export function apply(ctx: Context, config?: ConnectionConfig): void {
         path,
         handler: (req, socket, head) => {
           if (!isTrustedApiRequest(req, trustedHosts)) {
+            rejectWebSocketUpgrade(socket)
+            return
+          }
+          // Authenticated deployments reject anonymous stream opens: a stream
+          // with no resolved user would push every account's sessions.
+          if (getRequestUserResolver() !== undefined && getRequestUserResolver()?.(req) === undefined) {
             rejectWebSocketUpgrade(socket)
             return
           }

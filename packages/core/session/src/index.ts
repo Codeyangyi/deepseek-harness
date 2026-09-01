@@ -8,6 +8,7 @@
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import { isAbsolute } from 'node:path'
+import { getActiveUserId, isVisibleTo } from '@deepseek-ai/dsh-home-paths'
 import { deepFreeze } from '@deepseek-ai/dsh-llm'
 import { scopeOf, scopeTarget } from '@deepseek-ai/dsh-scope'
 import type { Scoped } from '@deepseek-ai/dsh-scope'
@@ -404,6 +405,8 @@ interface SessionEntry {
   readonly session: Session
   readonly carrier: Scoped<Session>
   readonly emitCtx: Context
+  /** Authenticated owner at entry time; `undefined` for headless/CLI (no active user). */
+  owner: string | undefined
   announced: boolean
   announcing: boolean
   appending: boolean
@@ -922,6 +925,7 @@ export class SessionStore extends Service {
       session,
       carrier,
       emitCtx: this.ctx,
+      owner: getActiveUserId(),
       announced: false,
       announcing: false,
       appending: false,
@@ -1053,15 +1057,37 @@ export class SessionStore extends Service {
    * @returns the session, or undefined when no live session has that id.
    */
   get(id: SessionId): Session | undefined {
-    return this.store.get(id)?.session
+    const entry = this.store.get(id)
+    if (entry === undefined) return undefined
+    // Single visibility gate: a scoped request resolves only sessions it owns,
+    // while headless/CLI (no authenticated deployment) still sees everything.
+    if (!isVisibleTo(entry.owner)) return undefined
+    return entry.session
   }
 
   /**
-   * All live sessions, in creation order.
+   * All live sessions visible to the caller, in creation order.
+   *
+   * On an authenticating deployment only the caller's own sessions are
+   * returned, so one account cannot enumerate another's conversations; an
+   * anonymous caller sees none. Without authentication every session is
+   * returned, unchanged.
    * @returns a fresh array; mutating it does not affect the store.
    */
   list(): Session[] {
-    return [...this.store.values()].map(entry => entry.session)
+    return [...this.store.values()].filter(e => isVisibleTo(e.owner)).map(e => e.session)
+  }
+
+  /**
+   * The authenticated owner this session was attached by, or `undefined` for
+   * headless/CLI (no active user). Host-side stream plumbing (mux/host event
+   * streams) filters pushes by this value when a caller-scoped user is active,
+   * so one account cannot observe another's sessions through a live stream.
+   * @param session - a live session owned by this store.
+   * @returns the owning user id, or undefined when attached with no active user.
+   */
+  ownerOf(session: Session): string | undefined {
+    return attachments.get(session)?.owner
   }
 
   /**

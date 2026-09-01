@@ -2,6 +2,7 @@
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
+import { getRequestUserResolver, runWithActiveUser } from '@deepseek-ai/dsh-home-paths'
 import {
   clientRequestSchema,
   RpcId,
@@ -76,13 +77,24 @@ export class HostConnectionService extends Service implements HostConnectionHand
       fetch: (request) => {
         const endpoint = endpointFromPath(channel, new URL(request.url).pathname)
         const interceptor = this.interceptors.get(channel)
-        if (endpoint === undefined || interceptor === undefined || !interceptor.matches(endpoint)) {
-          return fallback.fetch(request)
+        const userId = getRequestUserResolver()?.(request)
+        // Authenticated deployments (a request-user resolver is registered)
+        // reject anonymous requests outright: without a resolved user the
+        // session store would enumerate every account's conversations. The
+        // auth plugin's own raw routes (login/register/me) are exact-path
+        // routes and never reach this prefix handler.
+        if (getRequestUserResolver() !== undefined && userId === undefined) {
+          return Promise.resolve(new Response('unauthorized', { status: 401 }))
         }
-        if (interceptor.options.authority === 'loopback' && !isTrustedApiRequest(request, [])) {
-          return Promise.resolve(new Response('forbidden', { status: 403 }))
-        }
-        return interceptor.fetchHandler.fetch(request)
+        return runWithActiveUser(userId, () => {
+          if (endpoint === undefined || interceptor === undefined || !interceptor.matches(endpoint)) {
+            return fallback.fetch(request)
+          }
+          if (interceptor.options.authority === 'loopback' && !isTrustedApiRequest(request, [])) {
+            return Promise.resolve(new Response('forbidden', { status: 403 }))
+          }
+          return interceptor.fetchHandler.fetch(request)
+        })
       },
     }
   }
@@ -105,7 +117,8 @@ export class HostConnectionService extends Service implements HostConnectionHand
           res.end('forbidden')
           return
         }
-        await bridge(req, res, fetchHandler)
+        const userId = getRequestUserResolver()?.(req)
+        await runWithActiveUser(userId, () => bridge(req, res, fetchHandler))
       },
     }
     return owner.effect(

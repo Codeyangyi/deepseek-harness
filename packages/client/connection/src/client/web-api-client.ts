@@ -9,10 +9,28 @@ import { HOST_EVENTS_PATH, MUX_EVENTS_PATH } from '../api-path.ts'
 type SocketItem<F> = { kind: 'frame'; envelope: RpcRequest<F> } | { kind: 'end' }
 type Parser<F> = { parse(value: unknown): F }
 
+/**
+ * Pluggable bearer-token source (Plan A login). The web shell installs a
+ * provider reading the logged-in session's token from `localStorage`; the
+ * carrier attaches it to every `/api` request and WebSocket upgrade so the
+ * server can scope the call to the authenticated user.
+ */
+let authTokenProvider: (() => string | undefined) | undefined
+
+export function setAuthTokenProvider(provider: (() => string | undefined) | undefined): void {
+  authTokenProvider = provider
+}
+
+function authBearerHeader(): Record<string, string> {
+  const token = authTokenProvider?.()
+  return token === undefined ? {} : { Authorization: `Bearer ${token}` }
+}
+
 /** Browser platform subclass: unary/respond use fetch; mux/host use downlink-only WebSockets. */
 export class WebApiClient extends AbstractApiClient {
   protected doFetch(input: URL, init?: RequestInit): Promise<Response> {
-    return globalThis.fetch(input, init)
+    const headers = { ...(init?.headers ?? {}), ...authBearerHeader() }
+    return globalThis.fetch(input, { ...init, headers })
   }
 
   protected override openMux(
@@ -39,6 +57,8 @@ export class WebApiClient extends AbstractApiClient {
   ): AsyncGenerator<RpcRequest<F>> {
     const url = new URL(path, this.resolveBase())
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+    const token = authTokenProvider?.()
+    if (token !== undefined) url.searchParams.set('token', token)
     const socket = new WebSocket(url)
     const inbox: SocketItem<F>[] = []
     let wake: (() => void) | undefined

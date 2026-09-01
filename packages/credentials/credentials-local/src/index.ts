@@ -42,7 +42,7 @@ import { mkdir, readFile, stat } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { Document, parseDocument, type YAMLError } from 'yaml'
 import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
-import { canonicalizeWatchPath, resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { canonicalizeWatchPath, getActiveUserId, resolveDshHome, userScopedDshHome } from '@deepseek-ai/dsh-home-paths'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { CredentialProvider, credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { CredentialInfo, CredentialRef, ResolvedCredential } from '@deepseek-ai/dsh-credentials'
@@ -61,6 +61,14 @@ export interface Config {
   watch?: boolean
   /** Watcher write-settle window in milliseconds; defaults to 100. */
   debounceMs?: number
+  /**
+   * When true, the document path follows the request's authenticated user via
+   * {@link userScopedDshHome}, isolating each account's credentials under
+   * `<home>/users/<id>/.credentials.yaml`. Off by default so headless/CLI keeps
+   * the shared document. The watcher is disabled in this mode (the path is
+   * resolved per operation, so a single fixed watch would be wrong).
+   */
+  userScope?: boolean
 }
 
 /** Fully resolved provider parameters; defaulting happens here, never inline. */
@@ -213,17 +221,51 @@ export class LocalCredentialProvider extends CredentialProvider {
     dshHome: z.string(),
     watch: z.boolean().default(true),
     debounceMs: z.number().min(0).default(100),
+    userScope: z.boolean().default(false),
   })
 
   private readonly spec: ResolvedSpec
   /**
-   * Raw text of the last read or persisted document; `undefined` while the
-   * file is absent. Watcher events whose content equals this cache are no-ops,
-   * which is also the self-write suppression.
+   * Shared caches used when `userScope` is off. Under user scoping the account
+   * below isolates each account so one user cannot observe another's secrets.
    */
-  private text: string | undefined
-  /** Parsed document snapshot; replaced wholesale on every reload. */
-  private values = new Map<string, string>()
+  private sharedText: string | undefined = undefined
+  private sharedValues = new Map<string, string>()
+  /** Per-active-user raw text; keyed by the id resolved from the request. */
+  private readonly userText = new Map<string, string | undefined>()
+  /** Per-active-user parsed store; keyed by the id resolved from the request. */
+  private readonly userValues = new Map<string, Map<string, string>>()
+  /** Accounts whose document has been loaded into the per-user cache this session. */
+  private readonly loadedUsers = new Set<string>()
+
+  private get text(): string | undefined {
+    if (!this.config.userScope) return this.sharedText
+    return this.userText.get(getActiveUserId() ?? '<unauthenticated>')
+  }
+  private set text(value: string | undefined) {
+    if (!this.config.userScope) {
+      this.sharedText = value
+      return
+    }
+    this.userText.set(getActiveUserId() ?? '<unauthenticated>', value)
+  }
+  private get values(): Map<string, string> {
+    if (!this.config.userScope) return this.sharedValues
+    const id = getActiveUserId() ?? '<unauthenticated>'
+    let map = this.userValues.get(id)
+    if (map === undefined) {
+      map = new Map()
+      this.userValues.set(id, map)
+    }
+    return map
+  }
+  private set values(value: Map<string, string>) {
+    if (!this.config.userScope) {
+      this.sharedValues = value
+      return
+    }
+    this.userValues.set(getActiveUserId() ?? '<unauthenticated>', value)
+  }
   /**
    * Single exclusive operation chain: watcher reloads and line edits run one
    * at a time in queue order (settled tail), so an edit can never render from
@@ -238,6 +280,15 @@ export class LocalCredentialProvider extends CredentialProvider {
     return this.closed
   }
   /* jscpd:ignore-end */
+
+  /**
+   * The credentials document path, resolved per call so a scoped request reads
+   * the active user's file via {@link userScopedDshHome}. An explicit `path`
+   * always wins; otherwise it lives under the (possibly user-scoped) harness home.
+   */
+  private get activeFile(): string {
+    return resolve(this.config.path ?? join(userScopedDshHome(this.config.dshHome), CREDENTIALS_FILENAME))
+  }
 
   constructor(ctx: Context, public config: Config) {
     super(ctx)
@@ -270,11 +321,13 @@ export class LocalCredentialProvider extends CredentialProvider {
       await this.operations
     }
     await this.loadInitial()
-    if (!this.spec.watch) return
+    // The per-user document path is resolved per operation, so a single fixed
+    // watch would track the wrong file; hot reload is disabled in user-scoped mode.
+    if (!this.spec.watch || this.config.userScope) return
     /* jscpd:ignore-start -- same watcher discipline as settings-file by design:
        the serialized-refresh and quiesce-on-dispose shape is the reviewed
        lifecycle contract, not accidental repetition. */
-    const watcher = chokidarWatch(await canonicalizeWatchPath(this.spec.filename), {
+    const watcher = chokidarWatch(await canonicalizeWatchPath(this.activeFile), {
       ignoreInitial: true,
       awaitWriteFinish: {
         stabilityThreshold: this.spec.debounceMs,
@@ -293,7 +346,7 @@ export class LocalCredentialProvider extends CredentialProvider {
       this.queueRefresh()
     })
     watcher.on('error', (error) => {
-      this.ctx.logger.warn('credentials-local: watcher error on %s', this.spec.filename)
+      this.ctx.logger.warn('credentials-local: watcher error on %s', this.activeFile)
       this.ctx.logger.warn(error)
     })
     yield async () => {
@@ -306,28 +359,30 @@ export class LocalCredentialProvider extends CredentialProvider {
     /* jscpd:ignore-end */
   }
 
-  override resolve(ref: CredentialRef): Promise<ResolvedCredential | undefined> {
+  override async resolve(ref: CredentialRef): Promise<ResolvedCredential | undefined> {
     const inherited = this.inherited(ref)
-    if (inherited !== undefined) return Promise.resolve({ value: inherited, source: 'env' })
+    if (inherited !== undefined) return { value: inherited, source: 'env' }
+    if (this.config.userScope) await this.ensureLoaded()
     const stored = this.values.get(ref)
-    if (stored !== undefined) return Promise.resolve({ value: stored, source: 'file' })
+    if (stored !== undefined) return { value: stored, source: 'file' }
     const fallback = this.dotenvFallback(ref)
-    if (fallback !== undefined) return Promise.resolve({ value: fallback.value, source: fallback.source })
-    return Promise.resolve(undefined)
+    if (fallback !== undefined) return { value: fallback.value, source: fallback.source }
+    return undefined
   }
 
-  override describe(ref: CredentialRef): Promise<CredentialInfo> {
+  override async describe(ref: CredentialRef): Promise<CredentialInfo> {
     // Only the inherited environment is unwritable: it is the one layer this
     // process cannot edit. A user `.env` value is writable in the sense that
     // matters — storing a key replaces it as the effective one.
     if (this.inherited(ref) !== undefined) {
-      return Promise.resolve({ configured: true, source: 'env', writable: false })
+      return { configured: true, source: 'env', writable: false }
     }
+    if (this.config.userScope) await this.ensureLoaded()
     const stored = this.values.get(ref)
-    if (stored !== undefined) return Promise.resolve({ configured: true, source: 'file', writable: true })
+    if (stored !== undefined) return { configured: true, source: 'file', writable: true }
     const fallback = this.dotenvFallback(ref)
-    if (fallback !== undefined) return Promise.resolve({ configured: true, source: fallback.source, writable: true })
-    return Promise.resolve({ configured: false, writable: true })
+    if (fallback !== undefined) return { configured: true, source: fallback.source, writable: true }
+    return { configured: false, writable: true }
   }
 
   override async set(ref: CredentialRef, value: string): Promise<void> {
@@ -359,7 +414,7 @@ export class LocalCredentialProvider extends CredentialProvider {
       // Only an invariant violation escaping the update fan-out can reject a
       // refresh; keep the operation queue alive and surface it as an error so
       // one poisoned commit cannot silently end hot reloading forever.
-      this.ctx.logger.error('credentials-local: reload commit failed at %s', this.spec.filename)
+      this.ctx.logger.error('credentials-local: reload commit failed at %s', this.activeFile)
       this.ctx.logger.error(error)
     })
   }
@@ -380,8 +435,8 @@ export class LocalCredentialProvider extends CredentialProvider {
       this.assertUnshadowed(ref, verb)
       // The writer lock's exclusive create needs the parent to exist; 0700
       // because the harness home holds user-private data.
-      await mkdir(dirname(this.spec.filename), { recursive: true, mode: 0o700 })
-      await withFileLock(this.spec.filename, async () => {
+      await mkdir(dirname(this.activeFile), { recursive: true, mode: 0o700 })
+      await withFileLock(this.activeFile, async () => {
         // Read-modify-write: fold in any on-disk state this process has not
         // observed yet — an external edit still inside the watcher debounce
         // window, a change the watcher missed, or another process's write —
@@ -391,7 +446,7 @@ export class LocalCredentialProvider extends CredentialProvider {
         if (value === undefined && existing === undefined) return
         const nextText = renderDocument(this.text, ref, value)
         // 0600: a document holding secrets is never world-readable.
-        await writeFileAtomic(this.spec.filename, nextText, { mode: 0o600, dirMode: 0o700 })
+        await writeFileAtomic(this.activeFile, nextText, { mode: 0o600, dirMode: 0o700 })
         this.text = nextText
         if (value === undefined) this.values.delete(ref)
         else this.values.set(ref, value)
@@ -422,15 +477,15 @@ export class LocalCredentialProvider extends CredentialProvider {
    * cannot be trusted must never be treated as "no credentials stored".
    */
   private async loadInitial(): Promise<void> {
-    await assertOwnerOnly(this.spec.filename)
+    await assertOwnerOnly(this.activeFile)
     let text: string
     try {
-      text = await readFile(this.spec.filename, 'utf8')
+      text = await readFile(this.activeFile, 'utf8')
     } catch (error) {
       if (!isENOENT(error)) throw error
       return
     }
-    this.values = parseCredentialsDocument(text, this.spec.filename)
+    this.values = parseCredentialsDocument(text, this.activeFile)
     this.text = text
   }
 
@@ -450,9 +505,23 @@ export class LocalCredentialProvider extends CredentialProvider {
       await this.reconcileFromDisk()
     } catch (error) {
       if ((error as { code?: unknown } | null)?.code === 'INVARIANT') throw error
-      this.ctx.logger.warn('credentials-local: reload failed at %s; keeping the last good document', this.spec.filename)
+      this.ctx.logger.warn('credentials-local: reload failed at %s; keeping the last good document', this.activeFile)
       this.ctx.logger.warn(error)
     }
+  }
+
+  /**
+   * In user-scoped mode, populate this account's per-user cache from its file on
+   * first read so a pre-existing `.credentials.yaml` is observed. The watcher is
+   * disabled under userScope, so this is the only lazy-load path; writes go
+   * through `reconcileFromDisk` directly.
+   */
+  private async ensureLoaded(): Promise<void> {
+    const id = getActiveUserId()
+    if (id === undefined) return
+    if (this.loadedUsers.has(id)) return
+    await this.reconcileFromDisk()
+    this.loadedUsers.add(id)
   }
 
   /**
@@ -465,16 +534,16 @@ export class LocalCredentialProvider extends CredentialProvider {
   private async reconcileFromDisk(): Promise<void> {
     // Re-checked on every reload and before every write: an external editor or
     // a restored backup can loosen the mode after boot.
-    await assertOwnerOnly(this.spec.filename)
+    await assertOwnerOnly(this.activeFile)
     let text: string | undefined
     try {
-      text = await readFile(this.spec.filename, 'utf8')
+      text = await readFile(this.activeFile, 'utf8')
     } catch (error) {
       if (!isENOENT(error)) throw error
       text = undefined
     }
     if (text === this.text || this.isClosed()) return
-    const next = text === undefined ? new Map<string, string>() : parseCredentialsDocument(text, this.spec.filename)
+    const next = text === undefined ? new Map<string, string>() : parseCredentialsDocument(text, this.activeFile)
     const changed = this.changedRefs(this.values, next)
     this.text = text
     this.values = next

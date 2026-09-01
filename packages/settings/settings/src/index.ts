@@ -328,7 +328,13 @@ interface SettingsRegistration {
   applies: SettingsApplies
   /** Owner-supplied check for constraints the schema cannot express. */
   validate?: (value: unknown) => void
-  resolved: unknown
+  /**
+   * Resolved value keyed by user scope: `undefined` holds the registration-time
+   * default (and the single document for non-user-scoped providers); an active
+   * account id isolates that account's resolved settings. Keying per user is what
+   * stops one account from observing another's resolved settings under userScope.
+   */
+  resolved: Map<string | undefined, unknown>
   /**
    * Monotonic counter over this namespace's RAW user section — bumped by any
    * change to what is stored, including one whose resolved value is
@@ -349,8 +355,35 @@ interface SettingsRegistration {
  */
 export abstract class SettingsProvider extends Service {
   private readonly registrations = new Map<SettingsNamespace, SettingsRegistration>()
-  /** Latest published raw document; empty until the provider's first publish. */
-  private document: Record<string, unknown> = {}
+  /**
+   * Published raw documents keyed by user scope. The `undefined` key is the
+   * single shared document for non-user-scoped providers; a user-scoped subclass
+   * resolves the active account's key so one account cannot observe another's
+   * stored settings.
+   */
+  private documents = new Map<string | undefined, Record<string, unknown>>()
+  /**
+   * Overridden by user-scoped subclasses to return the active account's cache key
+   * (e.g. the authenticated user id). The default `undefined` keeps the
+   * historical single-document behavior for every other provider.
+   */
+  protected activeUserKey(): string | undefined {
+    return undefined
+  }
+  /** The active user's raw document, created on first access. */
+  private get activeDocument(): Record<string, unknown> {
+    const key = this.activeUserKey()
+    let doc = this.documents.get(key)
+    if (doc === undefined) {
+      doc = {}
+      this.documents.set(key, doc)
+    }
+    return doc
+  }
+  /** Resolved value for the active user, falling back to the registration default. */
+  private resolvedFor(registration: SettingsRegistration): unknown {
+    return registration.resolved.get(this.activeUserKey()) ?? registration.resolved.get(undefined)
+  }
   /** Per-namespace write chains; settled tails, so a failure never poisons the queue. */
   private readonly writeQueues = new Map<SettingsNamespace, Promise<unknown>>()
   /** In-flight watcher invocation segments, drained by the dispose teardown. */
@@ -444,7 +477,7 @@ export abstract class SettingsProvider extends Service {
       ...options?.validate === undefined
         ? {}
         : { validate: options.validate as (value: unknown) => void },
-      resolved: deepFreeze(this.resolve(schema, options?.base, this.section(ns), options?.validate)),
+      resolved: new Map([[undefined, deepFreeze(this.resolve(schema, options?.base, this.section(ns), options?.validate))]]),
       revision: 0,
       watchers: new Set(),
     }
@@ -455,7 +488,7 @@ export abstract class SettingsProvider extends Service {
       return () => this.registrations.delete(ns)
     }, `settings.register(${JSON.stringify(String(ns))})`)
     return {
-      get: () => registration.resolved as T,
+      get: () => this.resolvedFor(registration) as T,
       watch: (callback) => {
         const watcher: SettingsWatcher = { callback: callback, tail: Promise.resolve(), active: true }
         registration.watchers.add(watcher)
@@ -492,7 +525,7 @@ export abstract class SettingsProvider extends Service {
       const descriptor: SettingsDescriptor = {
         ns: registration.ns,
         schema: registration.schema.toJSON(),
-        value: registration.resolved,
+        value: this.resolvedFor(registration),
         revision: registration.revision,
         ...base === undefined ? {} : { base },
         ...detachedUser === undefined ? {} : { user: detachedUser },
@@ -500,7 +533,7 @@ export abstract class SettingsProvider extends Service {
       }
       if (options?.redactSecrets !== true) return descriptor
       const schema = registration.schema as z<never>
-      const redacted = redactSecrets(schema, registration.resolved)
+      const redacted = redactSecrets(schema, this.resolvedFor(registration))
       return {
         ...descriptor,
         value: redacted.value,
@@ -517,7 +550,9 @@ export abstract class SettingsProvider extends Service {
    * @returns the resolved value, or `undefined` while unregistered.
    */
   get(ns: SettingsNamespace): unknown {
-    return this.registrations.get(ns)?.resolved
+    const registration = this.registrations.get(ns)
+    if (registration === undefined) return undefined
+    return this.resolvedFor(registration)
   }
 
   /**
@@ -635,7 +670,7 @@ export abstract class SettingsProvider extends Service {
       // The write reached storage either way; the cache must say so. Commit
       // only when this registration is still the namespace owner — a fiber
       // disposed (or replaced) mid-persist must not receive the notification.
-      this.document[ns] = section
+      this.activeDocument[ns] = section
       // TODO(settings-replacement-resync): Re-resolve any replacement registration
       // from this persisted section so an old in-flight write cannot leave it stale.
       if (this.registrations.get(ns) === registration && !this.isStopped()) {
@@ -668,7 +703,7 @@ export abstract class SettingsProvider extends Service {
         before.set(registration.ns, undefined)
       }
     }
-    this.document = doc
+    this.documents.set(this.activeUserKey(), doc)
     for (const registration of this.registrations.values()) {
       let next: unknown
       try {
@@ -685,7 +720,7 @@ export abstract class SettingsProvider extends Service {
 
   /** Read one namespace's raw user section, rejecting non-object sections. */
   private section(ns: SettingsNamespace): Record<string, unknown> | undefined {
-    const section = this.document[ns]
+    const section = this.activeDocument[ns]
     if (section === undefined) return undefined
     if (!isPlainObject(section)) {
       throw new TypeError(`settings section "${ns}" must be an object of keys`)
@@ -747,9 +782,9 @@ export abstract class SettingsProvider extends Service {
 
   /** Commit a resolved value when changed: swap, notify watchers, emit the event. */
   private commit(registration: SettingsRegistration, next: unknown, source: SettingsUpdateSource): void {
-    const prev = registration.resolved
+    const prev = this.resolvedFor(registration)
     if (deepEqualJson(next, prev)) return
-    registration.resolved = next
+    registration.resolved.set(this.activeUserKey(), next)
     for (const watcher of [...registration.watchers]) {
       // Serialize per watcher: invocations of one callback run one at a time
       // in commit order, so a slow stale invocation can never apply after a

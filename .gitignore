@@ -38,3 +38,6 @@ apps/web/dist/
 worktrees/
 .agents/worktrees/
 .typert-*/
+.workbuddy/
+_tmp_*/
+.tmp_*

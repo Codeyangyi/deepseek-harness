@@ -11,6 +11,7 @@ import z from '@deepseek-ai/schemastery'
 import { readdirSync } from 'node:fs'
 import { open, mkdir, readFile, readdir, realpath, link, rm, stat, truncate } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
+import { resolveDshHome, userScopedDshHome } from '@deepseek-ai/dsh-home-paths'
 import { performance } from 'node:perf_hooks'
 import { scheduler } from 'node:timers/promises'
 import { randomBytes } from 'node:crypto'
@@ -66,6 +67,14 @@ export interface Config {
    * readable directory; an absent root is created on first materialization.
    */
   root: string
+  /**
+   * When true, the effective root follows the request's authenticated user via
+   * {@link userScopedDshHome}, isolating each account's sessions under
+   * `<home>/users/<id>/<relative-root>`. Off by default so headless/CLI runs
+   * keep the single shared root. The relative portion of `root` beneath the
+   * harness home is preserved (e.g. `storages`).
+   */
+  userScope?: boolean
   /**
    * Write runs of consecutive `assistant/chunk` delta events as packed
    * `text-chunks`/`reasoning-chunks`/`tool-call-chunks` rows (lossless,
@@ -125,6 +134,7 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
 
   static Config: z<Config> = z.object({
     root: z.string().required(),
+    userScope: z.boolean().default(false),
     packChunks: z.boolean().default(DEFAULT_PACK_CHUNKS),
     compression: JsonlCompressionSchema,
     preparedSessionCacheSize: z.number().step(1).min(1).default(DEFAULT_PREPARED_SESSION_CACHE_SIZE),
@@ -139,16 +149,35 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
    */
   override readonly name = 'session-persistence-jsonl'
 
-  private root: string
+  private configuredRoot: string
+  private relativeRoot: string
   private packChunks: boolean
   private compression: JsonlCompression
   private coordinator: PersistenceCoordinator<JsonlTornMarker>
   private rootEncodingCheck: Promise<void> | undefined
 
+  /**
+   * The active storage root. When `userScope` is set, the root follows the
+   * request's authenticated user via {@link userScopedDshHome}, isolating each
+   * account's sessions under `<home>/users/<id>/<relative-root>`; otherwise the
+   * configured root is used unchanged. Resolution happens per access so it picks
+   * up the user scoped by {@link runWithActiveUser} around each RPC.
+   */
+  private get root(): string {
+    if (!this.config.userScope) return this.configuredRoot
+    return join(userScopedDshHome(), this.relativeRoot)
+  }
+
   constructor(ctx: Context, public config: Config) {
     super(ctx)
     // Resolve once so later process.cwd() changes cannot split one backend across roots.
-    this.root = resolve(config.root)
+    this.configuredRoot = resolve(config.root)
+    // Preserve the configured root's portion beneath the harness home so a
+    // user-scoped root keeps the same relative layout (e.g. `storages`).
+    const base = resolveDshHome()
+    this.relativeRoot = this.configuredRoot.startsWith(base)
+      ? this.configuredRoot.slice(base.length).replace(/^[\\/]/, '')
+      : 'storages'
     // Programmatic wrappers may construct the backend without Schemastery normalization.
     const preparedSessionCacheSize = config.preparedSessionCacheSize
       ?? DEFAULT_PREPARED_SESSION_CACHE_SIZE

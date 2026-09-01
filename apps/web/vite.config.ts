@@ -146,6 +146,13 @@ export default defineConfig({
       { find: /^@deepseek-ai\/dsh-client-ui-attachment$/, replacement: src('../../packages/client/ui-attachment/src/index.ts') },
       { find: /^@deepseek-ai\/dsh-client-schema-form$/, replacement: src('../../packages/client/schema-form/src/index.ts') },
       { find: /^@deepseek-ai\/dsh-client-modules\/client$/, replacement: src('../../packages/client/modules/src/client/index.ts') },
+      // Client session runtime: alias to source so per-account session
+      // scoping (packages/client/runtime/src/client/auth-context.ts and the
+      // guarded edits in sessions/service.ts) ship in the browser bundle
+      // without a separate lib rebuild. Subpath alias must precede the bare
+      // name so /client wins.
+      { find: /^@deepseek-ai\/dsh-client-runtime\/client$/, replacement: src('../../packages/client/runtime/src/client/index.ts') },
+      { find: /^@deepseek-ai\/dsh-client-runtime$/, replacement: src('../../packages/client/runtime/src/index.ts') },
     ],
   },
   define: {

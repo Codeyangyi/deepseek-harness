@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, stat } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
+import { getActiveUserId, isVisibleTo, runWithActiveUser } from '@deepseek-ai/dsh-home-paths'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type { Agent, ModelSelection, ModelSelectionRef, AgentOptions, AgentStatus } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-presets/types'
@@ -3429,11 +3430,22 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
     events: {
       mux(_request, signal) {
         const queue = new FrameQueue<RpcRequest<MuxFrame>>()
+        // Stream-scoped isolation: the caller's id is captured at open (the
+        // connection layer wraps the open in runWithActiveUser) and re-entered
+        // for every later judgement, because event listeners fire outside the
+        // request's async context. `owned` is the only visibility gate in this
+        // stream — baseline frames and every push go through it, so a new
+        // listener cannot ship without isolation.
+        const callerUid = getActiveUserId()
+        const owned = (session: Session | undefined): boolean =>
+          runWithActiveUser(callerUid, () =>
+            isVisibleTo(session === undefined ? undefined : ctx.sessions.ownerOf(session)))
         muxQueues.add(queue)
         for (const session of ctx.sessions.list()) {
-          subscribeSession(queue, session)
+          if (owned(session)) subscribeSession(queue, session)
         }
         for (const pending of pendingQuestions.values()) {
+          if (!owned(ctx.sessions.get(pending.sessionId))) continue
           queue.push({
             rpcId: pending.rpcId,
             payload: {
@@ -3444,11 +3456,15 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
         }
         // Refresh recovery: still-pending approval questions replay with their
         // stable rpcId so a reconnecting client can still answer them.
-        for (const pending of pendingApprovals.values()) queue.push(requestedFrame(pending))
+        for (const pending of pendingApprovals.values()) {
+          if (!owned(ctx.sessions.get(pending.sessionId))) continue
+          queue.push(requestedFrame(pending))
+        }
         // Queue snapshot baseline (pendingQuestions precedent): frames replayed
         // in arrival order per session; a reconnecting client rebuilds its
         // queue view from these alone.
         for (const session of ctx.sessions.list()) {
+          if (!owned(session)) continue
           const agent = ctx.agents.get(session.id)
           if (agent?.session === session && agent.inbox.hasPending) {
             queue.push(frame({ type: 'session/queue', sessionId: session.id, items: queueItems(agent) }))
@@ -3461,6 +3477,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
         const jobs = ctx.get('jobs')
         if (jobs !== undefined) {
           for (const session of ctx.sessions.list()) {
+            if (!owned(session)) continue
             const views = jobViews(jobs.list(ctx.agents.get(session.id)))
             if (views.length > 0) {
               queue.push(frame({ type: 'session/jobs', sessionId: session.id, jobs: views }))
@@ -3473,6 +3490,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
         const openCalls = new Map<SessionId, Map<string, { name: string; args: unknown }>>()
         const disposers = [
           ctx.on('session/event', (session: Session, event: SessionEvent) => {
+            if (!owned(session)) return
             if (event.type === 'tool/call') {
               const data = event.data as ToolCallData
               try {
@@ -3493,6 +3511,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
             queue.push(frame({ type: 'session/event', sessionId: session.id, event, ...view === undefined ? {} : { view } }))
           }),
           ctx.on('session/created', (session: Session) => {
+            if (!owned(session)) return
             subscribeSession(queue, session)
             // The subscribe frame clears the client's task mirror, and a
             // session born after the stream opened missed the baseline loop.
@@ -3504,6 +3523,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
             }
           }),
           ctx.on('session/disposed', (session: Session) => {
+            if (!owned(session)) return
             openCalls.delete(session.id)
           }),
           ...jobs === undefined ? [] : [jobs.onJobsChanged((owner) => {
@@ -3511,12 +3531,14 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
               // The exact owner instance the fence compares against, so the
               // push stays correct even while that Agent's scope is tearing
               // down and a lookup by id would already miss.
+              if (!owned(owner.session)) return
               queue.push(frame({ type: 'session/jobs', sessionId: owner.id, jobs: jobViews(jobs.list(owner)) }))
               return
             }
             // An unowned task is visible to every caller, so every subscribed
             // session's set changed with it.
             for (const session of ctx.sessions.list()) {
+              if (!owned(session)) continue
               queue.push(frame({
                 type: 'session/jobs',
                 sessionId: session.id,
@@ -3533,6 +3555,17 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
 
       host(_request, signal) {
         const queue = new FrameQueue<RpcRequest<HostFrame>>()
+        // Same stream-scoped isolation as mux: session-addressed host frames
+        // are filtered by the caller's captured id; workspace frames are
+        // deployment-global and stay unfiltered.
+        const callerUid = getActiveUserId()
+        // Converged to the single `isVisibleTo` gate (fail-closed): an
+        // anonymous caller on an authenticating deployment sees nothing, rather
+        // than every session. The listener fires outside the request context,
+        // so the captured id is re-entered for the check.
+        const visible = (session: Session | undefined): boolean =>
+          runWithActiveUser(callerUid, () =>
+            isVisibleTo(session === undefined ? undefined : ctx.sessions.ownerOf(session)))
         const committedWorkspaces = ctx.workspaceRegistry.list()
         const committedWorkspaceIds = new Set(
           committedWorkspaces.map(workspace => String(workspace.id)),
@@ -3544,6 +3577,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
         let archivedSessionIds = ctx.workspaceRegistry.archivedSessionIds
         const disposers = [
           ctx.on('session/created', (session: Session) => {
+            if (!visible(session)) return
             queue.push(frame({
               type: 'host/session-added',
               sessionId: session.id,
@@ -3555,12 +3589,15 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
             }))
           }),
           ctx.on('session/disposed', (session: Session) => {
+            if (!visible(session)) return
             queue.push(frame({ type: 'host/session-removed', sessionId: session.id }))
           }),
           ctx.on('agent/status', ({ agent, status }: { agent: Agent; status: AgentStatus }) => {
+            if (!visible(agent.session)) return
             queue.push(frame({ type: 'host/session-status', sessionId: agent.id, running: status === 'running' }))
           }),
           ctx.on('agent/error', ({ agent, error }: { agent: Agent; error: unknown }) => {
+            if (!visible(agent.session)) return
             queue.push(frame({ type: 'host/agent-error', sessionId: agent.id, message: errorChain(error) }))
           }),
           ctx.on('domain/changed', (change) => {
