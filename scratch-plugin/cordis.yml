@@ -1,0 +1,3 @@
+- insert:
+    - id: auth
+      name: 'file:///F:/deepseek-harness/scratch-plugin/src/auth-plugin.ts'
