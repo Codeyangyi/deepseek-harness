@@ -54,6 +54,19 @@ export type MessageFeedbackSessionIdentity = z.infer<typeof messageFeedbackSessi
 export const messageFeedbackRowSchema = z.object({
   session: messageFeedbackSessionIdentitySchema,
   items: z.array(messageFeedbackItemSchema),
+  /**
+   * Owning account id, stamped from the authenticated caller when the row is
+   * first written. Optional because this domain has no migration path: a
+   * version bump discards the medium and a required field makes an existing
+   * row unparseable. Rows without an owner are legacy and read as empty on an
+   * authenticating deployment (`isVisibleTo` fails closed).
+   *
+   * This is the second gate, not the first: every entry point already
+   * requires the session to exist in the caller's own per-account
+   * persistence root, so ownership here makes the domain self-describing
+   * rather than relying on an upstream check.
+   */
+  owner: z.string().optional(),
 }).superRefine((row, ctx) => {
   const messageIds = new Set<string>()
   const versions = new Set<string>()

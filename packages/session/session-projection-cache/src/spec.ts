@@ -53,6 +53,15 @@ export type CheckpointIdentity = z.infer<typeof checkpointIdentity>
 export const checkpointRecord = z.object({
   identity: checkpointIdentity,
   rows: z.record(z.string(), checkpointRow),
+  /**
+   * Owning account id, stamped from the authenticated caller when the record
+   * is written. Optional because a cache has no migration path worth taking:
+   * a version bump discards the medium and a required field makes an existing
+   * record unparseable. Records without an owner are legacy and are treated
+   * as misses on an authenticating deployment (`isVisibleTo` fails closed) —
+   * a miss costs a longer tail replay, never a wrong value.
+   */
+  owner: z.string().optional(),
 })
 
 /** One stored per-session checkpoint record, inferred from {@link checkpointRecord}. */

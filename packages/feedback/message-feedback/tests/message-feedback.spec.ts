@@ -1,14 +1,17 @@
 import { randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import type { MessageId } from '@deepseek-ai/dsh-llm/brand'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol'
-import MessageFeedbackService, { messageFeedbackRowSchema } from '../src/index.ts'
+import MessageFeedbackService, { messageFeedbackDomainSpec, messageFeedbackRowSchema } from '../src/index.ts'
 import type {
   MessageFeedbackItem,
   MessageFeedbackVersion,
 } from '../src/index.ts'
+import { runWithActiveUser, setRequestUserResolver } from '@deepseek-ai/dsh-home-paths'
 import {
   appendMessageFixture,
   messageFixture,
@@ -28,6 +31,15 @@ afterEach(async () => {
   vi.useRealTimers()
   await Promise.all(harnesses.splice(0).map(value => value.dispose()))
 })
+
+/** Read the durable owner stamped on one session's feedback row, from the on-disk JSON medium. */
+async function storedOwner(harness: TestHarness, sessionId: SessionId): Promise<string | undefined> {
+  // Let the json backend flush its in-memory state to disk.
+  await new Promise(resolve => setTimeout(resolve, 0))
+  const text = await readFile(join(harness.root, `${messageFeedbackDomainSpec.name}.json`), 'utf8')
+  const doc = JSON.parse(text) as { tables: { sessions: Record<string, { owner?: string }> } }
+  return doc.tables.sessions[String(sessionId)]?.owner
+}
 
 function staleVersion(): MessageFeedbackVersion {
   return randomUUID() as MessageFeedbackVersion
@@ -651,5 +663,87 @@ describe('MessageFeedbackService durability ordering', () => {
       ok: true,
       value: { items: [{ messageId: fixture.assistantMessageIds[0] }] },
     })
+  })
+})
+
+describe('MessageFeedbackService per-account isolation', () => {
+  afterEach(() => { setRequestUserResolver(undefined) })
+
+  it('stamps the active user as the owner when feedback is written', async () => {
+    // Mirror the API proxy: the RPC wraps the call in runWithActiveUser. The
+    // durable owner must be that account, captured at write time — the fix that
+    // keeps a user's own feedback visible instead of fail-closed for everyone.
+    setRequestUserResolver(() => 'alice')
+    const h = await harness()
+    const fixture = messageFixture('isolation-stamp')
+    h.persistence.persist(fixture.session)
+    await runWithActiveUser('alice', () => h.ctx.messageFeedback.put({
+      sessionId: fixture.session.id,
+      messageId: fixture.assistantMessageIds[0],
+      rating: 'positive',
+      ifVersion: null,
+    }))
+    expect(await storedOwner(h, fixture.session.id)).toBe('alice')
+  })
+
+  it('hides another account’s feedback from the acting account’s list', async () => {
+    setRequestUserResolver(() => 'bob')
+    const h = await harness()
+    const fixture = messageFixture('isolation-other')
+    h.persistence.persist(fixture.session)
+    // alice writes her feedback; the row is owned by alice.
+    await runWithActiveUser('alice', () => h.ctx.messageFeedback.put({
+      sessionId: fixture.session.id,
+      messageId: fixture.assistantMessageIds[0],
+      rating: 'positive',
+      ifVersion: null,
+    }))
+    // bob, authenticated, must not see alice's row (the belt to inspectSession's braces).
+    const listed = await runWithActiveUser('bob', () =>
+      h.ctx.messageFeedback.list({ sessionId: fixture.session.id }))
+    if (!listed.ok) throw new Error(`expected list ok, got ${listed.error.code}`)
+    expect(listed.value.items).toEqual([])
+  })
+
+  it('shows the owning account its own feedback', async () => {
+    setRequestUserResolver(() => 'alice')
+    const h = await harness()
+    const fixture = messageFixture('isolation-own')
+    h.persistence.persist(fixture.session)
+    await runWithActiveUser('alice', () => h.ctx.messageFeedback.put({
+      sessionId: fixture.session.id,
+      messageId: fixture.assistantMessageIds[0],
+      rating: 'positive',
+      ifVersion: null,
+    }))
+    // alice sees her own row — and because an undefined owner would also be
+    // fail-closed for alice, a non-empty list proves the owner was stamped 'alice'.
+    const listed = await runWithActiveUser('alice', () =>
+      h.ctx.messageFeedback.list({ sessionId: fixture.session.id }))
+    if (!listed.ok) throw new Error(`expected list ok, got ${listed.error.code}`)
+    expect(listed.value.items).toHaveLength(1)
+    expect(listed.value.items[0]?.messageId).toBe(fixture.assistantMessageIds[0])
+  })
+
+  it('hides unowned legacy feedback from authenticated accounts (fail-closed)', async () => {
+    const h = await harness()
+    const fixture = messageFixture('isolation-legacy')
+    h.persistence.persist(fixture.session)
+    // Write while isolation is inactive so the service stamps owner = undefined
+    // (a pre-isolation / legacy record). No runWithActiveUser, so the active
+    // store is empty and the row carries no owner.
+    await h.ctx.messageFeedback.put({
+      sessionId: fixture.session.id,
+      messageId: fixture.assistantMessageIds[0],
+      rating: 'positive',
+      ifVersion: null,
+    })
+    // Now mount auth and act as bob: isVisibleTo(undefined) fails closed, so the
+    // legacy row is invisible to an authenticated caller.
+    setRequestUserResolver(() => 'bob')
+    const listed = await runWithActiveUser('bob', () =>
+      h.ctx.messageFeedback.list({ sessionId: fixture.session.id }))
+    if (!listed.ok) throw new Error(`expected list ok, got ${listed.error.code}`)
+    expect(listed.value.items).toEqual([])
   })
 })

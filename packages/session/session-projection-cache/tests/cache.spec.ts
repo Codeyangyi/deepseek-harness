@@ -14,7 +14,8 @@ import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
-import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
+import type { ProjectionDefinition, ProjectionSnapshot } from '@deepseek-ai/dsh-session-projection'
+import { runWithActiveUser, setRequestUserResolver } from '@deepseek-ai/dsh-home-paths'
 import { MemoryMediaPool, MemoryStorageBackend } from '../../../storage/storage-domain/tests/helpers/memory-backend.ts'
 import SessionProjectionCache from '../src/index.ts'
 
@@ -101,6 +102,7 @@ function storedRecord(pool: MemoryMediaPool, id: Session['id']) {
     {
       identity: { createdAt: number; cwd?: string }
       rows: Record<string, { ver: number; seq: number; val: unknown }>
+      owner?: string
     } | undefined
 }
 
@@ -111,6 +113,37 @@ function storedRows(pool: MemoryMediaPool, id: Session['id']) {
 
 /** Wait until queued fail-soft writes (event-listener fire-and-forget) drain. */
 const settle = () => new Promise(resolve => setTimeout(resolve, 0))
+
+/** A stored log of turn/start, a sequence of cache-test/mark events, and turn/end. */
+function storedLog(marks: string[][]): SessionEvent[] {
+  const events: SessionEvent[] = [
+    { type: 'turn/start', seq: 0, time: 0, data: { turn: 1 } },
+  ]
+  for (const m of marks) {
+    events.push({ type: 'cache-test/mark', seq: events.length, time: events.length, data: { marks: m } })
+  }
+  events.push({ type: 'turn/end', seq: events.length, time: events.length, data: { turn: 1, reason: { kind: 'completed' } } })
+  return events
+}
+
+/** Pre-seed the medium with one stored checkpoint record (before the domain opens). */
+function seedRow(
+  pool: MemoryMediaPool,
+  id: string,
+  row: { ver: number; seq: number; val: unknown },
+  identity: { createdAt: number; cwd?: string } = { createdAt: 0 },
+  owner?: string,
+): void {
+  pool.versions.set('session_projcache', 3)
+  pool.media.set('session_projcache', {
+    tables: new Map([['sessions', new Map([[id, {
+      identity,
+      rows: { 'cache-test/marks': row },
+      ...(owner === undefined ? {} : { owner }),
+    }]])]]),
+    global: null,
+  })
+}
 
 afterEach(async () => {
   vi.useRealTimers()
@@ -219,31 +252,6 @@ describe('SessionProjectionCache write policy', () => {
 })
 
 describe('SessionProjectionCache cold read', () => {
-  const storedLog = (marks: string[][]): SessionEvent[] => {
-    const events: SessionEvent[] = [
-      { type: 'turn/start', seq: 0, time: 0, data: { turn: 1 } },
-    ]
-    for (const m of marks) {
-      events.push({ type: 'cache-test/mark', seq: events.length, time: events.length, data: { marks: m } })
-    }
-    events.push({ type: 'turn/end', seq: events.length, time: events.length, data: { turn: 1, reason: { kind: 'completed' } } })
-    return events
-  }
-
-  /** Pre-seed the medium with one stored checkpoint record (before the domain opens). */
-  function seedRow(
-    pool: MemoryMediaPool,
-    id: string,
-    row: { ver: number; seq: number; val: unknown },
-    identity: { createdAt: number; cwd?: string } = { createdAt: 0 },
-  ): void {
-    pool.versions.set('session_projcache', 3)
-    pool.media.set('session_projcache', {
-      tables: new Map([['sessions', new Map([[id, { identity, rows: { 'cache-test/marks': row } }]])]]),
-      global: null,
-    })
-  }
-
   it('serves a cold session from the cache row plus a bounded tail read, and writes the refresh back', async () => {
     const pool = new MemoryMediaPool()
     const logs = new Map([['cold', storedLog([['a'], ['a', 'b']])]])
@@ -383,5 +391,82 @@ describe('SessionProjectionCache cold read', () => {
     await expect(ctx.sessionProjectionCache.coldSnapshot(SessionId('absent'))).rejects.toThrow('not found')
     await expect(ctx.sessionProjectionCache.coldSnapshot(SessionId('bare')))
       .resolves.toEqual({ asOfSeq: 2, values: {} })
+  })
+})
+
+describe('SessionProjectionCache per-account isolation', () => {
+  afterEach(() => { setRequestUserResolver(undefined) })
+
+  it('stamps the active user as the owner when a checkpoint is written', async () => {
+    // Mirror the API proxy: capture the caller synchronously at RPC entry. The
+    // durable owner must be that account even though the write-behind chain
+    // (flush, then the table put) runs after the request scope has unwound —
+    // the fix for every checkpoint previously being stored owner-less and
+    // therefore fail-closed for all on an authenticating deployment.
+    setRequestUserResolver(() => 'alice')
+    const { ctx, pool } = await harness()
+    const session = ctx.sessions.create(SessionId('owner-stamp'))
+    mark(session, ['a'])
+    await runWithActiveUser('alice', () => ctx.sessionProjectionCache.write(session))
+    expect(storedRecord(pool, session.id)?.owner).toBe('alice')
+  })
+
+  it('hides another account’s checkpoint from the acting account’s cachedSnapshot and cold ladder', async () => {
+    setRequestUserResolver(() => 'bob')
+    const pool = new MemoryMediaPool()
+    const logs = new Map([['alice-session', storedLog([['a'], ['a', 'b']])]])
+    // A checkpoint owned by alice, at watermark 1 (only ['a'] folded).
+    seedRow(pool, 'alice-session', { ver: 1, seq: 1, val: { marks: ['a'] } }, { createdAt: 0 }, 'alice')
+    const { cache, persistence } = await harness({ pool, logs })
+    const id = SessionId('alice-session')
+
+    // Synchronous read: the zero-I/O listing must not surface another account's row.
+    let cached: ProjectionSnapshot | undefined
+    await runWithActiveUser('bob', () => { cached = cache.cachedSnapshot(headerOf(id)) })
+    expect(cached).toBeUndefined()
+
+    // Cold read: the owned row is rejected by the gate, so the ladder refuses
+    // to trust alice's cached floor and re-reads from the log floor (0) instead
+    // of 1. (In production the log itself is per-account, so bob would never
+    // replay alice's data; here the fake persistence has no ownership check, so
+    // the meaningful assertion is that the cached cut is not trusted.)
+    persistence.readFrom.mockClear()
+    await runWithActiveUser('bob', async () => { await cache.coldSnapshot(id) })
+    expect(persistence.readFrom).toHaveBeenCalledWith(id, 0, undefined)
+    expect(persistence.readFrom).not.toHaveBeenCalledWith(id, 1, undefined)
+  })
+
+  it('shows the owning account its own checkpoint, used as the cold-read floor', async () => {
+    setRequestUserResolver(() => 'alice')
+    const pool = new MemoryMediaPool()
+    const logs = new Map([['own', storedLog([['a'], ['a', 'b']])]])
+    seedRow(pool, 'own', { ver: 1, seq: 1, val: { marks: ['a'] } }, { createdAt: 0 }, 'alice')
+    const { cache, persistence } = await harness({ pool, logs })
+    const id = SessionId('own')
+
+    let cached: ProjectionSnapshot | undefined
+    await runWithActiveUser('alice', () => { cached = cache.cachedSnapshot(headerOf(id)) })
+    expect(cached?.values['cache-test/marks']).toEqual({ marks: ['a'] })
+
+    persistence.readFrom.mockClear()
+    let cold: ProjectionSnapshot | undefined
+    await runWithActiveUser('alice', async () => { cold = await cache.coldSnapshot(id) })
+    expect(cold?.values['cache-test/marks']).toEqual({ marks: ['a', 'b'] })
+    // The owned cached row was accepted as the floor (bounded read), not a full re-read.
+    expect(persistence.readFrom).toHaveBeenCalledWith(id, 1, undefined)
+  })
+
+  it('hides unowned legacy checkpoints from authenticated accounts (fail-closed)', async () => {
+    setRequestUserResolver(() => 'bob')
+    const pool = new MemoryMediaPool()
+    // A legacy checkpoint with no owner: created before per-account isolation.
+    seedRow(pool, 'legacy', { ver: 1, seq: 2, val: { marks: ['old'] } })
+    const { cache } = await harness({ pool })
+    const id = SessionId('legacy')
+    // Isolation is active (resolver mounted) so isVisibleTo(owner = undefined)
+    // fails closed for the authenticated bob — the row is invisible.
+    let cached: ProjectionSnapshot | undefined
+    await runWithActiveUser('bob', () => { cached = cache.cachedSnapshot(headerOf(id)) })
+    expect(cached).toBeUndefined()
   })
 })

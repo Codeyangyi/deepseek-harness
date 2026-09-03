@@ -6,6 +6,7 @@
 import { Buffer } from 'node:buffer'
 import { randomUUID } from 'node:crypto'
 import { Context, Service } from '@deepseek-ai/cordis'
+import { getActiveUserId, isVisibleTo } from '@deepseek-ai/dsh-home-paths'
 import s from '@deepseek-ai/schemastery'
 import { deriveEventMessage, isAppendSurfaceEvent } from '@deepseek-ai/dsh-session/surface'
 import type { SessionHeader, SessionId } from '@deepseek-ai/dsh-session/types'
@@ -119,12 +120,14 @@ function sameHeaderIdentity(left: SessionHeader, right: SessionHeader): boolean 
 function rowSnapshot(
   session: MessageFeedbackSessionIdentity,
   items: readonly MessageFeedbackItem[],
+  owner: string | undefined,
 ): MessageFeedbackRow {
   const copiedItems = items.map(snapshotItem)
   Object.freeze(copiedItems)
   return Object.freeze({
     session,
     items: copiedItems,
+    ...(owner === undefined ? {} : { owner }),
   })
 }
 
@@ -182,7 +185,8 @@ export class MessageFeedbackService extends TypertRemoteService {
 
   /**
    * Read feedback belonging to the current persisted Session lifecycle.
-   * A stale row from a reused Session id is invisible.
+   * A stale row from a reused Session id is invisible, and so is a row owned
+   * by another account.
    * @param request - Session identity to inspect and list.
    * @returns current immutable items or `session-not-found`.
    */
@@ -190,9 +194,8 @@ export class MessageFeedbackService extends TypertRemoteService {
   async list(request: MessageFeedbackListRequest): Promise<MessageFeedbackListResult> {
     const known = await this.inspectSession(request.sessionId)
     if (!known.ok) return known
-    const row = this.requireTable().get(request.sessionId)
-    const items = row !== undefined && sameIdentity(row, known.value.meta) ? row.items : EMPTY_ITEMS
-    return success(snapshotList(items))
+    const row = this.visibleRow(request.sessionId, known.value.meta)
+    return success(snapshotList(row?.items ?? EMPTY_ITEMS))
   }
 
   /**
@@ -228,8 +231,7 @@ export class MessageFeedbackService extends TypertRemoteService {
       }
 
       const table = this.requireTable()
-      const stored = table.get(request.sessionId)
-      const current = stored !== undefined && sameIdentity(stored, durable.meta) ? stored : undefined
+      const current = this.visibleRow(request.sessionId, durable.meta)
       const items = current?.items ?? EMPTY_ITEMS
       const index = items.findIndex(item => item.messageId === request.messageId)
       const existing = items[index]
@@ -256,7 +258,11 @@ export class MessageFeedbackService extends TypertRemoteService {
       else nextItems[index] = item
       await table.put(
         request.sessionId,
-        rowSnapshot(identityOf(durable.meta), nextItems),
+        rowSnapshot(
+          identityOf(durable.meta),
+          nextItems,
+          current?.owner ?? getActiveUserId(),
+        ),
       )
       return success(snapshotItem(item))
     })
@@ -275,8 +281,7 @@ export class MessageFeedbackService extends TypertRemoteService {
       if (!known.ok) return known
 
       const table = this.requireTable()
-      const stored = table.get(request.sessionId)
-      const current = stored !== undefined && sameIdentity(stored, known.value.meta) ? stored : undefined
+      const current = this.visibleRow(request.sessionId, known.value.meta)
       const items = current?.items ?? EMPTY_ITEMS
       const existing = items.find(item => item.messageId === request.messageId)
       if (existing === undefined) {
@@ -288,10 +293,28 @@ export class MessageFeedbackService extends TypertRemoteService {
 
       await table.put(
         request.sessionId,
-        rowSnapshot(identityOf(known.value.meta), items.filter(item => item !== existing)),
+        rowSnapshot(
+          identityOf(known.value.meta),
+          items.filter(item => item !== existing),
+          current?.owner ?? getActiveUserId(),
+        ),
       )
       return success<MessageFeedbackDeleteValue>(Object.freeze({ absent: true }))
     })
+  }
+
+  /**
+   * The stored row for one session, when it belongs to both the inspected
+   * lifecycle and the acting account. A stale row from a reused Session id is
+   * invisible, and so is a row owned by another account: the session
+   * inspection upstream already proves the caller owns the session, so this
+   * gate is the belt to that braces — it keeps the domain from ever serving
+   * a row it did not record for this account.
+   */
+  private visibleRow(sessionId: SessionId, header: SessionHeader): MessageFeedbackRow | undefined {
+    const row = this.requireTable().get(sessionId)
+    if (row === undefined || !sameIdentity(row, header)) return undefined
+    return isVisibleTo(row.owner) ? row : undefined
   }
 
   /**

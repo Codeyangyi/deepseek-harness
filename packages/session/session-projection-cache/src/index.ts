@@ -16,6 +16,7 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { snapshotJsonValue } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
+import { getActiveUserId, isVisibleTo } from '@deepseek-ai/dsh-home-paths'
 // Empty type import: applies the package's cordis Context merge
 // (`ctx.sessionPersistence`), which this service reads on the cold path.
 import type {} from '@deepseek-ai/dsh-session-persistence'
@@ -94,13 +95,19 @@ export class SessionProjectionCache extends Service {
    * a recreated id or a persistence store swapped under a surviving cache
    * must not let an old record seed state folded from an unrelated log.
    * Synchronous from the domain's in-memory state.
+   *
+   * A record owned by another account is treated as absent: the fold it
+   * carries was folded from that account's log, and serving it here would
+   * seed a projection from events this account never saw. The cost of the
+   * miss is one tail replay, which is the cache's designed failure mode.
    * @param id - the session whose record is read.
    * @param expected - the log identity the caller holds (live or stored header).
-   * @returns the identity-matching record, or `undefined` (absent or unrelated).
+   * @returns the identity- and ownership-matching record, or `undefined`.
    */
   private recordFor(id: SessionId, expected: CheckpointIdentity): CheckpointRecord | undefined {
     const record = this.requireTable().get(id)
     if (record === undefined) return undefined
+    if (!isVisibleTo(record.owner)) return undefined
     return identityMatches(record.identity, expected) ? record : undefined
   }
 
@@ -138,6 +145,14 @@ export class SessionProjectionCache extends Service {
    * @returns resolution after durability and event emission.
    */
   async write(session: Session): Promise<void> {
+    // Capture the owner synchronously, before any `await`, so the durable row
+    // is stamped with the request's active account even though the write-behind
+    // continuation (flush, then the table `put`) runs after the request scope
+    // has unwound. Without this, `getActiveUserId()` returns `undefined` on the
+    // deferred `put` and every checkpoint becomes owner-less — fail-closed for
+    // everyone on an authenticating deployment, so no account can read its own
+    // cache (the bug the message-feedback domain also guards against).
+    const owner = getActiveUserId()
     const rows = this.ctx.sessionProjections.checkpoint(session)
     this.markClean(session)
     // Durability barrier: the checkpoint cut was taken above, so flushing
@@ -148,7 +163,7 @@ export class SessionProjectionCache extends Service {
     // already gone; persistence's own retirement drain covers that path and
     // any residual overreach is caught by the cold read's anchored floor.
     if (this.ctx.sessions.get(session.id) === session) await this.ctx.sessions.flush(session)
-    await this.put(session.id, identityOf(session.header), rows)
+    await this.put(session.id, identityOf(session.header), rows, owner)
   }
 
   /**
@@ -164,7 +179,15 @@ export class SessionProjectionCache extends Service {
    * @returns the snapshot cut at the stored log end.
    */
   async coldSnapshot(id: SessionId, signal?: AbortSignal): Promise<ProjectionSnapshot> {
-    const record = this.requireTable().get(id)
+    // Capture the owner synchronously: the `putSoft` write-back below runs
+    // after awaits, but the caller's account must own the rebound row so the
+    // next cold read serves it rather than re-failing the ownership gate.
+    const owner = getActiveUserId()
+    const stored = this.requireTable().get(id)
+    // Same ownership gate as {@link recordFor}, applied before any row can
+    // seed the fold: the identity witness below proves the log is the right
+    // one, this proves the account is.
+    const record = stored !== undefined && isVisibleTo(stored.owner) ? stored : undefined
     const cached = record?.rows ?? {}
     const floor = this.ctx.sessionProjections.restoreFloor(cached)
     const persistence = this.ctx.sessionPersistence
@@ -192,7 +215,7 @@ export class SessionProjectionCache extends Service {
       const whole = await persistence.readFrom(id, 0, signal)
       restored = this.ctx.sessionProjections.restore({}, whole.events, 0)
     }
-    await this.putSoft(id, identityOf(tail.meta), restored.checkpoint, 'cold-read write-back')
+    await this.putSoft(id, identityOf(tail.meta), restored.checkpoint, 'cold-read write-back', owner)
     return restored.snapshot
   }
 
@@ -262,19 +285,32 @@ export class SessionProjectionCache extends Service {
     }
   }
 
-  /** Replace one session's stored record with its log identity and a detached snapshot of `rows`. */
-  private async put(id: SessionId, identity: CheckpointIdentity, rows: ProjectionCheckpoint): Promise<void> {
+  /** Replace one session's stored record with its log identity, a detached snapshot of `rows`, and the owning account. */
+  private async put(id: SessionId, identity: CheckpointIdentity, rows: ProjectionCheckpoint, owner?: string): Promise<void> {
     const detached = snapshotJsonValue(rows)
     if (detached === undefined) {
       throw new TypeError('projection checkpoint is not losslessly JSON-serializable (a unit state violates the plain-JSON contract)')
     }
-    await this.requireTable().put(id, { identity, rows: detached as CheckpointRecord['rows'] })
+    await this.requireTable().put(id, {
+      identity,
+      rows: detached as CheckpointRecord['rows'],
+      // `owner` is threaded from the caller's synchronous capture (write-behind
+      // entry / cold-read entry) so a deferred `getActiveUserId()` never stamps
+      // the row owner-less. The fallback keeps direct/legacy callers safe.
+      owner: owner ?? getActiveUserId(),
+    })
   }
 
   /** Fail-soft {@link put}: cache writes must never fail their caller's read or event path. */
-  private async putSoft(id: SessionId, identity: CheckpointIdentity, rows: ProjectionCheckpoint, what: string): Promise<void> {
+  private async putSoft(
+    id: SessionId,
+    identity: CheckpointIdentity,
+    rows: ProjectionCheckpoint,
+    what: string,
+    owner?: string,
+  ): Promise<void> {
     try {
-      await this.put(id, identity, rows)
+      await this.put(id, identity, rows, owner)
     } catch (error) {
       this.ctx.logger.warn(`session projection cache: ${what} for "${id}" failed (cache stays stale): ${String(error)}`)
     }
