@@ -24,6 +24,47 @@ function acknowledgementOf(view: SettingsNamespaceView): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 
+/**
+ * Browser-local fallback for the acknowledgement.
+ *
+ * Remote browsers keep `settings` loopback-only, so they run this store in
+ * memory mode. Memory state cannot survive a reload, and every login builds a
+ * fresh store — so without a browser-local record the notice reopened on every
+ * login and reload instead of once per copy version.
+ */
+export const LOCAL_ACK_KEY = 'dsh.ui-onboarding.welcomeNoticeVersion'
+
+/** The storage surface this fallback needs, narrowed for testability. */
+type AckStorage = Pick<Storage, 'getItem' | 'setItem'>
+
+/** @returns web storage, or undefined where it is absent or blocked. */
+function ackStorage(): AckStorage | undefined {
+  try {
+    return (globalThis as { localStorage?: AckStorage }).localStorage
+  } catch {
+    // Access itself throws in some sandboxed/SSR contexts.
+    return undefined
+  }
+}
+
+/** @returns the remembered copy version, or undefined when nothing was stored. */
+function readLocalAck(): string | undefined {
+  try {
+    return ackStorage()?.getItem(LOCAL_ACK_KEY) ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Remember the acknowledged version browser-locally; a no-op when unavailable. */
+function writeLocalAck(version: string): void {
+  try {
+    ackStorage()?.setItem(LOCAL_ACK_KEY, version)
+  } catch {
+    /* Storage blocked (private mode): the acknowledgement stays process-local. */
+  }
+}
+
 /** Coordinates durable Host acknowledgement or a process-local remote fallback. */
 export class WelcomeNoticeStore {
   /** uSES-safe state source shared by the registered welcome step. */
@@ -35,7 +76,9 @@ export class WelcomeNoticeStore {
 
   /**
    * @param api - settings wire face used for durable reads and writes.
-   * @param persistence - remote browsers use memory because settings is loopback-only.
+   * @param persistence - remote browsers use memory because settings is
+   * loopback-only; that mode remembers the acknowledgement in web storage so a
+   * reload or a later login does not reopen an already-dismissed notice.
    */
   constructor(
     private readonly api: Pick<IApiClient, 'settings'>,
@@ -46,7 +89,16 @@ export class WelcomeNoticeStore {
   async load(): Promise<void> {
     const generation = ++this.generation
     if (this.persistence === 'memory') {
-      this.store.update((state) => { state.status = 'ready'; state.error = null })
+      const remembered = readLocalAck()
+      this.store.update((state) => {
+        state.status = 'ready'
+        // Only a stored value decides. Absent storage must not erase an
+        // acknowledgement this process already recorded: the store instance
+        // outlives a single load, and a browser without storage would
+        // otherwise reopen the notice on every refresh of the same page.
+        if (remembered !== undefined) state.acknowledged = remembered === WELCOME_NOTICE_VERSION
+        state.error = null
+      })
       return
     }
     this.store.update((state) => { state.status = 'loading'; state.error = null })
@@ -80,6 +132,9 @@ export class WelcomeNoticeStore {
   async acknowledge(): Promise<boolean> {
     const generation = ++this.generation
     if (this.persistence === 'memory') {
+      // Make the dismissal stick across reloads and later logins in this
+      // browser; Host settings stay untouched because they are unreachable here.
+      writeLocalAck(WELCOME_NOTICE_VERSION)
       this.store.update((state) => {
         state.status = 'ready'
         state.acknowledged = true

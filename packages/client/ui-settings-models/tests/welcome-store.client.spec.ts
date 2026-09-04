@@ -1,6 +1,6 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RpcResponse } from '@deepseek-ai/dsh-api-remotes/client'
-import { refreshWelcomeIfLoaded, WelcomeNoticeStore } from '../src/client/welcome-store.ts'
+import { LOCAL_ACK_KEY, refreshWelcomeIfLoaded, WelcomeNoticeStore } from '../src/client/welcome-store.ts'
 import {
   WELCOME_NOTICE_ACK_FIELD, WELCOME_NOTICE_SETTINGS_NAMESPACE, WELCOME_NOTICE_VERSION,
 } from '../src/onboarding-copy.ts'
@@ -30,6 +30,41 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
+/** @returns web storage when this environment provides one. */
+function webStorage(): Storage | undefined {
+  return (globalThis as { localStorage?: Storage }).localStorage
+}
+
+/**
+ * Install an in-memory Storage stand-in so memory-mode persistence is testable
+ * in environments that ship no DOM storage.
+ * @param initial - entries to seed.
+ * @returns a disposer restoring the original global.
+ */
+function installLocalStorage(initial: Record<string, string> = {}): () => void {
+  const entries = new Map(Object.entries(initial))
+  const stub = {
+    getItem: (key: string) => entries.get(key) ?? null,
+    setItem: (key: string, value: string) => { entries.set(key, value) },
+    removeItem: (key: string) => { entries.delete(key) },
+    clear: () => { entries.clear() },
+    key: () => null,
+    length: 0,
+  } as unknown as Storage
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: stub })
+  return () => {
+    if (original === undefined) Reflect.deleteProperty(globalThis, 'localStorage')
+    else Object.defineProperty(globalThis, 'localStorage', original)
+  }
+}
+
+beforeEach(() => {
+  // Memory mode remembers the dismissal in web storage; keep every case
+  // independent of what an earlier case acknowledged.
+  webStorage()?.clear()
+})
+
 describe('WelcomeNoticeStore', () => {
   it('acknowledges in memory without calling loopback-only settings APIs', async () => {
     const describe = vi.fn()
@@ -44,6 +79,87 @@ describe('WelcomeNoticeStore', () => {
     expect(controller.store.getSnapshot()).toEqual({ status: 'ready', acknowledged: true, error: null })
     expect(describe).not.toHaveBeenCalled()
     expect(mutate).not.toHaveBeenCalled()
+  })
+
+  it('survives a reload: a fresh memory-mode store keeps the dismissal', async () => {
+    // Regression: each login builds a new store, and process-local state could
+    // not survive it, so the notice reopened on every login and reload.
+    const dispose = installLocalStorage()
+    try {
+      const api = { settings: { describe: vi.fn(), mutate: vi.fn() } }
+      const before = new WelcomeNoticeStore(api as never, 'memory')
+      await before.load()
+      expect(before.store.getSnapshot().acknowledged).toBe(false)
+      await expect(before.acknowledge()).resolves.toBe(true)
+
+      const after = new WelcomeNoticeStore(api as never, 'memory')
+      await after.load()
+      expect(after.store.getSnapshot()).toEqual({ status: 'ready', acknowledged: true, error: null })
+      expect(api.settings.describe).not.toHaveBeenCalled()
+      expect(api.settings.mutate).not.toHaveBeenCalled()
+    } finally {
+      dispose()
+    }
+  })
+
+  it('reopens the memory-mode notice when the stored copy version is older', async () => {
+    const dispose = installLocalStorage({ [LOCAL_ACK_KEY]: 'older-copy' })
+    try {
+      const controller = new WelcomeNoticeStore({
+        settings: { describe: vi.fn(), mutate: vi.fn() },
+      } as never, 'memory')
+      await controller.load()
+      expect(controller.store.getSnapshot()).toEqual({ status: 'ready', acknowledged: false, error: null })
+    } finally {
+      dispose()
+    }
+  })
+
+  it('degrades to process-local acknowledgement when web storage is blocked', async () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      get() { throw new Error('storage blocked') },
+    })
+    try {
+      const controller = new WelcomeNoticeStore({
+        settings: { describe: vi.fn(), mutate: vi.fn() },
+      } as never, 'memory')
+      await controller.load()
+      expect(controller.store.getSnapshot()).toEqual({ status: 'ready', acknowledged: false, error: null })
+      await expect(controller.acknowledge()).resolves.toBe(true)
+      // Still retained in-process: blocked storage must not reopen the notice
+      // on the next load of the same page.
+      await controller.load()
+      expect(controller.store.getSnapshot()).toEqual({ status: 'ready', acknowledged: true, error: null })
+    } finally {
+      if (original === undefined) Reflect.deleteProperty(globalThis, 'localStorage')
+      else Object.defineProperty(globalThis, 'localStorage', original)
+    }
+  })
+
+  it('ignores web-storage read and write failures in memory mode', async () => {
+    // Private-mode storage exists but rejects every access; containment must
+    // keep the notice flow working off process-local state alone.
+    const throwing = {
+      getItem() { throw new Error('denied') },
+      setItem() { throw new Error('denied') },
+    }
+    const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: throwing })
+    try {
+      const controller = new WelcomeNoticeStore({
+        settings: { describe: vi.fn(), mutate: vi.fn() },
+      } as never, 'memory')
+      await controller.load()
+      expect(controller.store.getSnapshot()).toEqual({ status: 'ready', acknowledged: false, error: null })
+      await expect(controller.acknowledge()).resolves.toBe(true)
+      await controller.load()
+      expect(controller.store.getSnapshot()).toEqual({ status: 'ready', acknowledged: true, error: null })
+    } finally {
+      if (original === undefined) Reflect.deleteProperty(globalThis, 'localStorage')
+      else Object.defineProperty(globalThis, 'localStorage', original)
+    }
   })
 
   it('acknowledges only the exact current copy version', async () => {
